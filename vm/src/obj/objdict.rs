@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fmt;
 
 use crate::function::{KwArgs, OptionalArg};
@@ -255,12 +255,13 @@ impl IntoIterator for &PyDictRef {
 
 pub struct DictIter {
     dict: PyDictRef,
-    position: usize,
+    position: dictdatatype::DictPosition,
 }
 
 impl DictIter {
     pub fn new(dict: PyDictRef) -> DictIter {
-        DictIter { dict, position: 0 }
+        let position = dict.entries.borrow().start_iter();
+        DictIter { dict, position }
     }
 }
 
@@ -268,11 +269,8 @@ impl Iterator for DictIter {
     type Item = (PyObjectRef, PyObjectRef);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.dict.entries.borrow().next_entry(self.position) {
-            Some((new_position, key, value)) => {
-                self.position = new_position;
-                Some((key.clone(), value.clone()))
-            }
+        match self.dict.entries.borrow().next_entry(&mut self.position) {
+            Some((key, value)) => Some((key.clone(), value.clone())),
             None => None,
         }
     }
@@ -313,25 +311,28 @@ macro_rules! dict_iterator {
         #[derive(Debug)]
         struct $iter_name {
             pub dict: PyDictRef,
-            pub position: Cell<usize>,
+            pub position: RefCell<dictdatatype::DictPosition>,
         }
 
         #[pyimpl(__inside_vm)]
         impl $iter_name {
             fn new(dict: PyDictRef) -> Self {
-                $iter_name {
-                    position: Cell::new(0),
-                    dict,
-                }
+                let position = RefCell::new(dict.entries.borrow().start_iter());
+                $iter_name { position, dict }
             }
 
             #[pymethod(name = "__next__")]
             fn next(&self, vm: &VirtualMachine) -> PyResult {
-                match self.dict.entries.borrow().next_entry(self.position.get()) {
-                    Some((new_position, key, value)) => {
-                        self.position.set(new_position);
-                        Ok($result_fn(vm, key, value))
-                    }
+                let position = &mut self.position.borrow_mut();
+                let dict = self.dict.entries.borrow();
+                if dict.has_changed_size(position) {
+                    return Err(vm.new_exception(
+                        vm.ctx.exceptions.runtime_error.clone(),
+                        "dictionary changed size during iteration".to_string(),
+                    ));
+                }
+                match dict.next_entry(position) {
+                    Some((key, value)) => Ok($result_fn(vm, key, value)),
                     None => Err(objiter::new_stop_iteration(vm)),
                 }
             }
