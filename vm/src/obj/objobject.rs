@@ -117,13 +117,22 @@ fn object_repr(zelf: PyObjectRef, _vm: &VirtualMachine) -> String {
     format!("<{} object at 0x{:x}>", zelf.class().name, zelf.get_id())
 }
 
-pub fn object_dir(obj: PyObjectRef, vm: &VirtualMachine) -> PyList {
-    let attributes = get_attributes(&obj);
-    let attributes: Vec<PyObjectRef> = attributes
-        .keys()
-        .map(|k| vm.ctx.new_str(k.to_string()))
-        .collect();
-    PyList::from(attributes)
+pub fn object_dir(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyList> {
+    let attributes: PyAttributes = objtype::get_attributes(obj.class());
+
+    let dict = PyDictRef::from_attributes(attributes, vm)?;
+
+    // Get instance attributes:
+    if let Some(object_dict) = &obj.dict {
+        vm.invoke(
+            vm.get_attribute(dict.clone().into_object(), "update")?,
+            object_dict.clone().into_object(),
+        )?;
+    }
+
+    let attributes: Vec<_> = dict.into_iter().map(|(k, _v)| k.clone()).collect();
+
+    Ok(PyList::from(attributes))
 }
 
 fn object_format(
@@ -158,7 +167,11 @@ pub fn init(context: &PyContext) {
         "__ge__" => context.new_rustfunc(object_ge),
         "__setattr__" => context.new_rustfunc(object_setattr),
         "__delattr__" => context.new_rustfunc(object_delattr),
-        "__dict__" => context.new_property(object_dict),
+        "__dict__" =>
+        PropertyBuilder::new(context)
+                .add_getter(object_dict)
+                .add_setter(object_dict_setter)
+                .create(),
         "__dir__" => context.new_rustfunc(object_dir),
         "__hash__" => context.new_rustfunc(object_hash),
         "__str__" => context.new_rustfunc(object_str),
@@ -192,6 +205,16 @@ fn object_dict(object: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyDictRef> 
     } else {
         Err(vm.new_type_error("TypeError: no dictionary.".to_string()))
     }
+}
+
+fn object_dict_setter(
+    _instance: PyObjectRef,
+    _value: PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult {
+    Err(vm.new_not_implemented_error(
+        "Setting __dict__ attribute on am object isn't yet implemented".to_string(),
+    ))
 }
 
 fn object_getattribute(obj: PyObjectRef, name_str: PyStringRef, vm: &VirtualMachine) -> PyResult {
@@ -229,18 +252,4 @@ fn object_getattr(
     } else {
         Ok(None)
     }
-}
-
-pub fn get_attributes(obj: &PyObjectRef) -> PyAttributes {
-    // Get class attributes:
-    let mut attributes = objtype::get_attributes(obj.class());
-
-    // Get instance attributes:
-    if let Some(dict) = &obj.dict {
-        for (key, value) in dict {
-            attributes.insert(key.to_string(), value.clone());
-        }
-    }
-
-    attributes
 }

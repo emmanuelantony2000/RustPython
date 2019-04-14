@@ -10,7 +10,6 @@ use crate::builtins;
 use crate::bytecode;
 use crate::function::PyFuncArgs;
 use crate::obj::objbool;
-use crate::obj::objbuiltinfunc::PyBuiltinFunction;
 use crate::obj::objcode::PyCodeRef;
 use crate::obj::objdict::{PyDict, PyDictRef};
 use crate::obj::objint::PyInt;
@@ -18,6 +17,7 @@ use crate::obj::objiter;
 use crate::obj::objlist;
 use crate::obj::objslice::PySlice;
 use crate::obj::objstr;
+use crate::obj::objstr::PyString;
 use crate::obj::objtuple::PyTuple;
 use crate::obj::objtype;
 use crate::obj::objtype::PyClassRef;
@@ -129,6 +129,8 @@ pub trait NameProtocol {
     fn store_name(&self, vm: &VirtualMachine, name: &str, value: PyObjectRef);
     fn delete_name(&self, vm: &VirtualMachine, name: &str);
     fn load_cell(&self, vm: &VirtualMachine, name: &str) -> Option<PyObjectRef>;
+    fn load_global(&self, vm: &VirtualMachine, name: &str) -> Option<PyObjectRef>;
+    fn store_global(&self, vm: &VirtualMachine, name: &str, value: PyObjectRef);
 }
 
 impl NameProtocol for Scope {
@@ -161,6 +163,14 @@ impl NameProtocol for Scope {
 
     fn delete_name(&self, vm: &VirtualMachine, key: &str) {
         self.get_locals().del_item(key, vm).unwrap();
+    }
+
+    fn load_global(&self, vm: &VirtualMachine, name: &str) -> Option<PyObjectRef> {
+        self.globals.get_item_option(name, vm).unwrap()
+    }
+
+    fn store_global(&self, vm: &VirtualMachine, name: &str, value: PyObjectRef) {
+        self.globals.set_item(name, value, vm).unwrap();
     }
 }
 
@@ -283,6 +293,17 @@ impl Frame {
         }
     }
 
+    pub fn throw(
+        &self,
+        vm: &VirtualMachine,
+        exception: PyObjectRef,
+    ) -> Result<ExecutionResult, PyObjectRef> {
+        match self.unwind_exception(vm, exception) {
+            None => self.run(vm),
+            Some(exception) => Err(exception),
+        }
+    }
+
     pub fn fetch_instruction(&self) -> &bytecode::Instruction {
         let ins2 = &self.code.instructions[*self.lasti.borrow()];
         *self.lasti.borrow_mut() += 1;
@@ -315,8 +336,14 @@ impl Frame {
                 ref symbol,
             } => self.import(vm, name, symbol),
             bytecode::Instruction::ImportStar { ref name } => self.import_star(vm, name),
-            bytecode::Instruction::LoadName { ref name } => self.load_name(vm, name),
-            bytecode::Instruction::StoreName { ref name } => self.store_name(vm, name),
+            bytecode::Instruction::LoadName {
+                ref name,
+                ref scope,
+            } => self.load_name(vm, name, scope),
+            bytecode::Instruction::StoreName {
+                ref name,
+                ref scope,
+            } => self.store_name(vm, name, scope),
             bytecode::Instruction::DeleteName { ref name } => self.delete_name(vm, name),
             bytecode::Instruction::StoreSubscript => self.execute_store_subscript(vm),
             bytecode::Instruction::DeleteSubscript => self.execute_delete_subscript(vm),
@@ -566,7 +593,10 @@ impl Frame {
                 }
             }
             bytecode::Instruction::MakeFunction { flags } => {
-                let _qualified_name = self.pop_value();
+                let qualified_name = self
+                    .pop_value()
+                    .downcast::<PyString>()
+                    .expect("qualified name to be a string");
                 let code_obj = self
                     .pop_value()
                     .downcast()
@@ -606,6 +636,15 @@ impl Frame {
                     .ctx
                     .new_function(code_obj, scope, defaults, kw_only_defaults);
 
+                let name = qualified_name.value.split('.').next_back().unwrap();
+                vm.set_attr(&obj, "__name__", vm.new_str(name.to_string()))?;
+                vm.set_attr(&obj, "__qualname__", qualified_name)?;
+                let module = self
+                    .scope
+                    .globals
+                    .get_item_option("__name__", vm)?
+                    .unwrap_or_else(|| vm.get_none());
+                vm.set_attr(&obj, "__module__", module)?;
                 vm.set_attr(&obj, "__annotations__", annotations)?;
 
                 self.push_value(obj);
@@ -677,31 +716,18 @@ impl Frame {
             }
 
             bytecode::Instruction::Raise { argc } => {
+                let cause = match argc {
+                    2 => self.get_exception(vm, true)?,
+                    _ => vm.get_none(),
+                };
                 let exception = match argc {
-                    1 => self.pop_value(),
-                    0 | 2 | 3 => panic!("Not implemented!"),
+                    1 | 2 => self.get_exception(vm, false)?,
+                    0 | 3 => panic!("Not implemented!"),
                     _ => panic!("Invalid parameter for RAISE_VARARGS, must be between 0 to 3"),
                 };
-                if objtype::isinstance(&exception, &vm.ctx.exceptions.base_exception_type) {
-                    info!("Exception raised: {:?}", exception);
-                    Err(exception)
-                } else if let Ok(exception) = PyClassRef::try_from_object(vm, exception) {
-                    if objtype::issubclass(&exception, &vm.ctx.exceptions.base_exception_type) {
-                        let exception = vm.new_empty_exception(exception)?;
-                        info!("Exception raised: {:?}", exception);
-                        Err(exception)
-                    } else {
-                        let msg = format!(
-                            "Can only raise BaseException derived types, not {}",
-                            exception
-                        );
-                        let type_error_type = vm.ctx.exceptions.type_error.clone();
-                        let type_error = vm.new_exception(type_error_type, msg);
-                        Err(type_error)
-                    }
-                } else {
-                    Err(vm.new_type_error("exceptions must derive from BaseException".to_string()))
-                }
+                info!("Exception raised: {:?} with cause: {:?}", exception, cause);
+                vm.set_attr(&exception, vm.new_str("__cause__".to_string()), cause)?;
+                Err(exception)
             }
 
             bytecode::Instruction::Break => {
@@ -739,9 +765,7 @@ impl Frame {
                 Ok(None)
             }
             bytecode::Instruction::LoadBuildClass => {
-                let rustfunc =
-                    PyBuiltinFunction::new(Box::new(builtins::builtin_build_class_)).into_ref(vm);
-                self.push_value(rustfunc.into_object());
+                self.push_value(vm.ctx.new_rustfunc(builtins::builtin_build_class_));
                 Ok(None)
             }
             bytecode::Instruction::UnpackSequence { size } => {
@@ -982,9 +1006,21 @@ impl Frame {
         vm.call_method(context_manager, "__exit__", args)
     }
 
-    fn store_name(&self, vm: &VirtualMachine, name: &str) -> FrameResult {
+    fn store_name(
+        &self,
+        vm: &VirtualMachine,
+        name: &str,
+        name_scope: &bytecode::NameScope,
+    ) -> FrameResult {
         let obj = self.pop_value();
-        self.scope.store_name(&vm, name, obj);
+        match name_scope {
+            bytecode::NameScope::Global => {
+                self.scope.store_global(vm, name, obj);
+            }
+            bytecode::NameScope::Local => {
+                self.scope.store_name(&vm, name, obj);
+            }
+        }
         Ok(None)
     }
 
@@ -993,19 +1029,29 @@ impl Frame {
         Ok(None)
     }
 
-    fn load_name(&self, vm: &VirtualMachine, name: &str) -> FrameResult {
-        match self.scope.load_name(&vm, name) {
-            Some(value) => {
-                self.push_value(value);
-                Ok(None)
-            }
+    fn load_name(
+        &self,
+        vm: &VirtualMachine,
+        name: &str,
+        name_scope: &bytecode::NameScope,
+    ) -> FrameResult {
+        let optional_value = match name_scope {
+            bytecode::NameScope::Global => self.scope.load_global(vm, name),
+            bytecode::NameScope::Local => self.scope.load_name(&vm, name),
+        };
+
+        let value = match optional_value {
+            Some(value) => value,
             None => {
                 let name_error_type = vm.ctx.exceptions.name_error.clone();
                 let msg = format!("name '{}' is not defined", name);
                 let name_error = vm.new_exception(name_error_type, msg);
-                Err(name_error)
+                return Err(name_error);
             }
-        }
+        };
+
+        self.push_value(value);
+        Ok(None)
     }
 
     fn execute_store_subscript(&self, vm: &VirtualMachine) -> FrameResult {
@@ -1203,6 +1249,28 @@ impl Frame {
     fn nth_value(&self, depth: usize) -> PyObjectRef {
         let stack = self.stack.borrow_mut();
         stack[stack.len() - depth - 1].clone()
+    }
+
+    fn get_exception(&self, vm: &VirtualMachine, none_allowed: bool) -> PyResult {
+        let exception = self.pop_value();
+        if none_allowed && vm.get_none().is(&exception)
+            || objtype::isinstance(&exception, &vm.ctx.exceptions.base_exception_type)
+        {
+            Ok(exception)
+        } else if let Ok(exception) = PyClassRef::try_from_object(vm, exception) {
+            if objtype::issubclass(&exception, &vm.ctx.exceptions.base_exception_type) {
+                let exception = vm.new_empty_exception(exception)?;
+                Ok(exception)
+            } else {
+                let msg = format!(
+                    "Can only raise BaseException derived types, not {}",
+                    exception
+                );
+                Err(vm.new_type_error(msg))
+            }
+        } else {
+            Err(vm.new_type_error("exceptions must derive from BaseException".to_string()))
+        }
     }
 }
 

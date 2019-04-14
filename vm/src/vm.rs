@@ -21,7 +21,7 @@ use crate::obj::objbuiltinfunc::PyBuiltinFunction;
 use crate::obj::objcode::PyCodeRef;
 use crate::obj::objdict::PyDictRef;
 use crate::obj::objfunction::{PyFunction, PyMethod};
-use crate::obj::objgenerator::PyGeneratorRef;
+use crate::obj::objgenerator::PyGenerator;
 use crate::obj::objiter;
 use crate::obj::objsequence;
 use crate::obj::objstr::{PyString, PyStringRef};
@@ -90,6 +90,17 @@ impl VirtualMachine {
     pub fn run_frame(&self, frame: FrameRef) -> PyResult<ExecutionResult> {
         self.frames.borrow_mut().push(frame.clone());
         let result = frame.run(self);
+        self.frames.borrow_mut().pop();
+        result
+    }
+
+    pub fn frame_throw(
+        &self,
+        frame: FrameRef,
+        exception: PyObjectRef,
+    ) -> PyResult<ExecutionResult> {
+        self.frames.borrow_mut().push(frame.clone());
+        let result = frame.throw(self, exception);
         self.frames.borrow_mut().pop();
         result
     }
@@ -221,6 +232,11 @@ impl VirtualMachine {
     pub fn new_overflow_error(&self, msg: String) -> PyObjectRef {
         let overflow_error = self.ctx.exceptions.overflow_error.clone();
         self.new_exception(overflow_error, msg)
+    }
+
+    pub fn new_syntax_error<T: ToString>(&self, msg: &T) -> PyObjectRef {
+        let syntax_error = self.ctx.exceptions.syntax_error.clone();
+        self.new_exception(syntax_error, msg.to_string())
     }
 
     pub fn get_none(&self) -> PyObjectRef {
@@ -374,7 +390,7 @@ impl VirtualMachine {
 
         // If we have a generator, create a new generator
         if code.code.is_generator {
-            Ok(PyGeneratorRef::new(frame, self).into_object())
+            Ok(PyGenerator::new(frame, self).into_object())
         } else {
             self.run_frame_full(frame)
         }

@@ -118,7 +118,7 @@ impl PyDictRef {
                 }
             }
         }
-        return Ok(true);
+        Ok(true)
     }
 
     fn eq(self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult {
@@ -237,6 +237,19 @@ impl PyDictRef {
             attrs.insert(key, value);
         }
         attrs
+    }
+
+    pub fn from_attributes(attrs: PyAttributes, vm: &VirtualMachine) -> PyResult<Self> {
+        let dict = DictContentType::default();
+        let entries = RefCell::new(dict);
+
+        for (key, value) in attrs {
+            entries
+                .borrow_mut()
+                .insert(vm, &vm.ctx.new_str(key), value)?;
+        }
+
+        Ok(PyDict { entries }.into_ref(vm))
     }
 
     fn hash(self, vm: &VirtualMachine) -> PyResult {
