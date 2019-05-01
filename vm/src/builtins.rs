@@ -11,11 +11,13 @@ use num_traits::Signed;
 use crate::compile;
 use crate::import::import_module;
 use crate::obj::objbool;
+use crate::obj::objcode::PyCodeRef;
 use crate::obj::objdict::PyDictRef;
 use crate::obj::objint::{self, PyIntRef};
 use crate::obj::objiter;
 use crate::obj::objstr::{self, PyString, PyStringRef};
-use crate::obj::objtype::{self, PyClassRef};
+use crate::obj::objtuple::PyTuple;
+use crate::obj::objtype::{self, PyClass, PyClassRef};
 
 use crate::frame::Scope;
 use crate::function::{Args, KwArgs, OptionalArg, PyFuncArgs};
@@ -25,7 +27,6 @@ use crate::pyobject::{
 };
 use crate::vm::VirtualMachine;
 
-use crate::obj::objcode::PyCodeRef;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::stdlib::io::io_open;
 
@@ -67,8 +68,8 @@ fn builtin_bin(x: PyIntRef, _vm: &VirtualMachine) -> String {
 
 // builtin_breakpoint
 
-fn builtin_callable(obj: PyObjectRef, _vm: &VirtualMachine) -> bool {
-    objtype::class_has_attr(&obj.class(), "__call__")
+fn builtin_callable(obj: PyObjectRef, vm: &VirtualMachine) -> bool {
+    vm.is_callable(&obj)
 }
 
 fn builtin_chr(i: u32, _vm: &VirtualMachine) -> String {
@@ -122,11 +123,14 @@ fn builtin_dir(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
 }
 
 fn builtin_divmod(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
-    arg_check!(vm, args, required = [(x, None), (y, None)]);
-    match vm.get_method(x.clone(), "__divmod__") {
-        Ok(attrib) => vm.invoke(attrib, vec![y.clone()]),
-        Err(..) => Err(vm.new_type_error("unsupported operand type(s) for divmod".to_string())),
-    }
+    arg_check!(vm, args, required = [(a, None), (b, None)]);
+    vm.call_or_reflection(
+        a.clone(),
+        b.clone(),
+        "__divmod__",
+        "__rdivmod__",
+        |vm, a, b| Err(vm.new_unsupported_operand_error(a, b, "divmod")),
+    )
 }
 
 /// Implements `eval`.
@@ -312,19 +316,37 @@ fn builtin_id(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
 
 // builtin_input
 
-fn builtin_isinstance(obj: PyObjectRef, typ: PyClassRef, vm: &VirtualMachine) -> PyResult<bool> {
-    vm.isinstance(&obj, &typ)
+fn type_test(
+    vm: &VirtualMachine,
+    typ: PyObjectRef,
+    test: impl Fn(&PyClassRef) -> PyResult<bool>,
+    test_name: &str,
+) -> PyResult<bool> {
+    match_class!(typ,
+        cls @ PyClass => test(&cls),
+        tuple @ PyTuple => {
+            for cls_obj in tuple.elements.borrow().iter() {
+                let cls = PyClassRef::try_from_object(vm, cls_obj.clone())?;
+                if test(&cls)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        _ => Err(vm.new_type_error(format!("{}() arg 2 must be a type or tuple of types", test_name)))
+    )
 }
 
-fn builtin_issubclass(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
-    arg_check!(
-        vm,
-        args,
-        required = [(subclass, Some(vm.get_type())), (cls, Some(vm.get_type()))]
-    );
+fn builtin_isinstance(obj: PyObjectRef, typ: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
+    type_test(vm, typ, |cls| vm.isinstance(&obj, cls), "isinstance")
+}
 
-    let issubclass = vm.issubclass(subclass, cls)?;
-    Ok(vm.context().new_bool(issubclass))
+fn builtin_issubclass(
+    subclass: PyClassRef,
+    typ: PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult<bool> {
+    type_test(vm, typ, |cls| vm.issubclass(&subclass, cls), "issubclass")
 }
 
 fn builtin_iter(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
@@ -530,7 +552,6 @@ fn builtin_pow(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
 }
 
 #[derive(Debug, FromArgs)]
-#[__inside_vm]
 pub struct PrintOptions {
     #[pyarg(keyword_only, default = "None")]
     sep: Option<PyStringRef>,
@@ -751,6 +772,8 @@ pub fn make_module(vm: &VirtualMachine, module: PyObjectRef) {
         "NameError" => ctx.exceptions.name_error.clone(),
         "OverflowError" => ctx.exceptions.overflow_error.clone(),
         "RuntimeError" => ctx.exceptions.runtime_error.clone(),
+        "ReferenceError" => ctx.exceptions.reference_error.clone(),
+        "SyntaxError" =>  ctx.exceptions.syntax_error.clone(),
         "NotImplementedError" => ctx.exceptions.not_implemented_error.clone(),
         "TypeError" => ctx.exceptions.type_error.clone(),
         "ValueError" => ctx.exceptions.value_error.clone(),

@@ -52,6 +52,22 @@ assert b.strip() == 'hallo'
 assert b.lstrip() == 'hallo  '
 assert b.rstrip() == '  hallo'
 
+s = '^*RustPython*^'
+assert s.strip('^*') == 'RustPython'
+assert s.lstrip('^*') == 'RustPython*^'
+assert s.rstrip('^*') == '^*RustPython'
+
+s = 'RustPython'
+assert s.ljust(8) == 'RustPython'
+assert s.rjust(8) == 'RustPython'
+assert s.ljust(12) == 'RustPython  '
+assert s.rjust(12) == '  RustPython'
+assert s.ljust(12, '_') == 'RustPython__'
+assert s.rjust(12, '_') == '__RustPython'
+# The fill character must be exactly one character long
+assert_raises(TypeError, lambda: s.ljust(12, '__'))
+assert_raises(TypeError, lambda: s.rjust(12, '__'))
+
 c = 'hallo'
 assert c.capitalize() == 'Hallo'
 assert c.center(11, '-') == '---hallo---'
@@ -132,7 +148,9 @@ assert 'abc\t12345\txyz'.expandtabs() == 'abc     12345   xyz'
 assert '-'.join(['1', '2', '3']) == '1-2-3'
 assert 'HALLO'.isupper()
 assert "hello, my name is".partition("my ") == ('hello, ', 'my ', 'name is')
+assert "hello".partition("is") == ('hello', '', '')
 assert "hello, my name is".rpartition("is") == ('hello, my name ', 'is', '')
+assert "hello".rpartition("is") == ('', '', 'hello')
 assert not ''.isdecimal()
 assert '123'.isdecimal()
 assert not '\u00B2'.isdecimal()

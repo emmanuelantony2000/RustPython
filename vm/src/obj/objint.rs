@@ -32,7 +32,7 @@ use crate::obj::objtype::PyClassRef;
 /// Base 0 means to interpret the base from the string as an integer literal.
 /// >>> int('0b100', base=0)
 /// 4
-#[pyclass(__inside_vm)]
+#[pyclass]
 #[derive(Debug)]
 pub struct PyInt {
     value: BigInt,
@@ -111,7 +111,7 @@ impl_try_from_object_int!(
     (u64, to_u64),
 );
 
-#[pyimpl(__inside_vm)]
+#[pyimpl]
 impl PyInt {
     #[pymethod(name = "__eq__")]
     fn eq(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyObjectRef {
@@ -476,7 +476,6 @@ impl PyInt {
 }
 
 #[derive(FromArgs)]
-#[__inside_vm]
 struct IntOptions {
     #[pyarg(positional_only, optional = true)]
     val_options: OptionalArg<PyObjectRef>,
@@ -534,6 +533,12 @@ pub fn to_int(vm: &VirtualMachine, obj: &PyObjectRef, base: u32) -> PyResult<Big
 // Retrieve inner int value:
 pub fn get_value(obj: &PyObjectRef) -> &BigInt {
     &obj.payload::<PyInt>().unwrap().value
+}
+
+pub fn get_float_value(obj: &PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
+    get_value(obj).to_f64().ok_or_else(|| {
+        vm.new_overflow_error("OverflowError: int too large to convert to float".to_string())
+    })
 }
 
 #[inline]

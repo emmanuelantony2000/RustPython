@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::string::ToString;
 
 use num_traits::ToPrimitive;
+use unicode_casing::CharExt;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::format::{FormatParseError, FormatPart, FormatString};
@@ -30,7 +31,7 @@ use super::objtype::{self, PyClassRef};
 /// or repr(object).
 /// encoding defaults to sys.getdefaultencoding().
 /// errors defaults to 'strict'."
-#[pyclass(name = "str", __inside_vm)]
+#[pyclass(name = "str")]
 #[derive(Clone, Debug)]
 pub struct PyString {
     // TODO: shouldn't be public
@@ -74,7 +75,7 @@ impl TryIntoRef<PyString> for &str {
     }
 }
 
-#[pyimpl(__inside_vm)]
+#[pyimpl]
 impl PyString {
     // TODO: should with following format
     // class str(object='')
@@ -295,18 +296,34 @@ impl PyString {
     }
 
     #[pymethod]
-    fn strip(&self, _vm: &VirtualMachine) -> String {
-        self.value.trim().to_string()
+    fn strip(&self, chars: OptionalArg<PyStringRef>, _vm: &VirtualMachine) -> String {
+        let chars = match chars {
+            OptionalArg::Present(ref chars) => &chars.value,
+            OptionalArg::Missing => return self.value.trim().to_string(),
+        };
+        self.value.trim_matches(|c| chars.contains(c)).to_string()
     }
 
     #[pymethod]
-    fn lstrip(&self, _vm: &VirtualMachine) -> String {
-        self.value.trim_start().to_string()
+    fn lstrip(&self, chars: OptionalArg<PyStringRef>, _vm: &VirtualMachine) -> String {
+        let chars = match chars {
+            OptionalArg::Present(ref chars) => &chars.value,
+            OptionalArg::Missing => return self.value.trim_start().to_string(),
+        };
+        self.value
+            .trim_start_matches(|c| chars.contains(c))
+            .to_string()
     }
 
     #[pymethod]
-    fn rstrip(&self, _vm: &VirtualMachine) -> String {
-        self.value.trim_end().to_string()
+    fn rstrip(&self, chars: OptionalArg<PyStringRef>, _vm: &VirtualMachine) -> String {
+        let chars = match chars {
+            OptionalArg::Present(ref chars) => &chars.value,
+            OptionalArg::Missing => return self.value.trim_end().to_string(),
+        };
+        self.value
+            .trim_end_matches(|c| chars.contains(c))
+            .to_string()
     }
 
     #[pymethod]
@@ -413,12 +430,12 @@ impl PyString {
         for c in self.value.chars() {
             if c.is_lowercase() {
                 if !previous_is_cased {
-                    title.extend(c.to_uppercase());
+                    title.extend(c.to_titlecase());
                 } else {
                     title.push(c);
                 }
                 previous_is_cased = true;
-            } else if c.is_uppercase() {
+            } else if c.is_uppercase() || c.is_titlecase() {
                 if previous_is_cased {
                     title.extend(c.to_lowercase());
                 } else {
@@ -634,9 +651,9 @@ impl PyString {
             new_tup.swap(0, 1); // so it's in the right order
             new_tup.insert(1, vm.ctx.new_str(sub.clone()));
         } else {
+            new_tup.push(vm.ctx.new_str("".to_string()));
+            new_tup.push(vm.ctx.new_str("".to_string()));
             new_tup.push(vm.ctx.new_str(value.clone()));
-            new_tup.push(vm.ctx.new_str("".to_string()));
-            new_tup.push(vm.ctx.new_str("".to_string()));
         }
         vm.ctx.new_tuple(new_tup)
     }
@@ -652,7 +669,7 @@ impl PyString {
         let mut cased = false;
         let mut previous_is_cased = false;
         for c in self.value.chars() {
-            if c.is_uppercase() {
+            if c.is_uppercase() || c.is_titlecase() {
                 if previous_is_cased {
                     return false;
                 }
@@ -723,7 +740,11 @@ impl PyString {
     ) -> PyResult<String> {
         let value = &self.value;
         let rep_char = Self::get_fill_char(&rep, vm)?;
-        Ok(format!("{}{}", value, rep_char.repeat(len)))
+        if len <= value.len() {
+            Ok(value.to_string())
+        } else {
+            Ok(format!("{}{}", value, rep_char.repeat(len - value.len())))
+        }
     }
 
     #[pymethod]
@@ -735,7 +756,11 @@ impl PyString {
     ) -> PyResult<String> {
         let value = &self.value;
         let rep_char = Self::get_fill_char(&rep, vm)?;
-        Ok(format!("{}{}", rep_char.repeat(len), value))
+        if len <= value.len() {
+            Ok(value.to_string())
+        } else {
+            Ok(format!("{}{}", rep_char.repeat(len - value.len()), value))
+        }
     }
 
     #[pymethod]
@@ -1050,6 +1075,7 @@ mod tests {
             ("Format,This-As*Title;String", "fOrMaT,thIs-aS*titLe;String"),
             ("Getint", "getInt"),
             ("Greek Ωppercases ...", "greek ωppercases ..."),
+            ("Greek ῼitlecases ...", "greek ῳitlecases ..."),
         ];
         for (title, input) in tests {
             assert_eq!(PyString::from(input).title(&vm).as_str(), title);
@@ -1066,6 +1092,7 @@ mod tests {
             "A\nTitlecased Line",
             "A Titlecased, Line",
             "Greek Ωppercases ...",
+            "Greek ῼitlecases ...",
         ];
 
         for s in pos {

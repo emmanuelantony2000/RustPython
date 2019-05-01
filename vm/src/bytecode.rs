@@ -41,6 +41,7 @@ pub type Label = usize;
 #[derive(Debug, Clone, PartialEq)]
 pub enum NameScope {
     Local,
+    NonLocal,
     Global,
 }
 
@@ -181,6 +182,7 @@ pub enum Instruction {
         conversion: Option<ast::ConversionFlag>,
         spec: String,
     },
+    PopException,
 }
 
 use self::Instruction::*;
@@ -379,6 +381,7 @@ impl Instruction {
             UnpackEx { before, after } => w!(UnpackEx, before, after),
             Unpack => w!(Unpack),
             FormatValue { spec, .. } => w!(FormatValue, spec), // TODO: write conversion
+            PopException => w!(PopException),
         }
     }
 }

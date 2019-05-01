@@ -10,11 +10,11 @@ extern crate rustyline;
 use clap::{App, Arg};
 use rustpython_parser::error::ParseError;
 use rustpython_vm::{
-    compile, error::CompileError, frame::Scope, import, obj::objstr, print_exception,
-    pyobject::PyResult, util, VirtualMachine,
+    compile, error::CompileError, error::CompileErrorType, frame::Scope, import, obj::objstr,
+    print_exception, pyobject::PyResult, util, VirtualMachine,
 };
 use rustyline::{error::ReadlineError, Editor};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     env_logger::init();
@@ -65,11 +65,8 @@ fn main() {
 }
 
 fn _run_string(vm: &VirtualMachine, source: &str, source_path: String) -> PyResult {
-    let code_obj =
-        compile::compile(vm, source, &compile::Mode::Exec, source_path).map_err(|err| {
-            let syntax_error = vm.context().exceptions.syntax_error.clone();
-            vm.new_exception(syntax_error, err.to_string())
-        })?;
+    let code_obj = compile::compile(vm, source, &compile::Mode::Exec, source_path)
+        .map_err(|err| vm.new_syntax_error(&err))?;
     // trace!("Code object: {:?}", code_obj.borrow());
     let vars = vm.ctx.new_scope(); // Keep track of local variables
     vm.run_code_obj(code_obj, vars)
@@ -99,14 +96,52 @@ fn run_module(vm: &VirtualMachine, module: &str) -> PyResult {
 fn run_script(vm: &VirtualMachine, script_file: &str) -> PyResult {
     debug!("Running file {}", script_file);
     // Parse an ast from it:
-    let file_path = Path::new(script_file);
-    match util::read_file(file_path) {
+    let file_path = PathBuf::from(script_file);
+    let file_path = if file_path.is_file() {
+        file_path
+    } else if file_path.is_dir() {
+        let main_file_path = file_path.join("__main__.py");
+        if main_file_path.is_file() {
+            main_file_path
+        } else {
+            error!(
+                "can't find '__main__' module in '{}'",
+                file_path.to_str().unwrap()
+            );
+            std::process::exit(1);
+        }
+    } else {
+        error!(
+            "can't open file '{}': No such file or directory",
+            file_path.to_str().unwrap()
+        );
+        std::process::exit(1);
+    };
+
+    match util::read_file(&file_path) {
         Ok(source) => _run_string(vm, &source, file_path.to_str().unwrap().to_string()),
         Err(err) => {
-            error!("Failed reading file: {:?}", err.kind());
+            error!(
+                "Failed reading file '{}': {:?}",
+                file_path.to_str().unwrap(),
+                err.kind()
+            );
             std::process::exit(1);
         }
     }
+}
+
+#[test]
+fn test_run_script() {
+    let vm = VirtualMachine::new();
+
+    // test file run
+    let r = run_script(&vm, "tests/snippets/dir_main/__main__.py");
+    assert!(r.is_ok());
+
+    // test module run
+    let r = run_script(&vm, "tests/snippets/dir_main");
+    assert!(r.is_ok());
 }
 
 fn shell_exec(vm: &VirtualMachine, source: &str, scope: Scope) -> Result<(), CompileError> {
@@ -118,10 +153,14 @@ fn shell_exec(vm: &VirtualMachine, source: &str, scope: Scope) -> Result<(), Com
             Ok(())
         }
         // Don't inject syntax errors for line continuation
-        Err(err @ CompileError::Parse(ParseError::EOF(_))) => Err(err),
+        Err(
+            err @ CompileError {
+                error: CompileErrorType::Parse(ParseError::EOF(_)),
+                ..
+            },
+        ) => Err(err),
         Err(err) => {
-            let syntax_error = vm.context().exceptions.syntax_error.clone();
-            let exc = vm.new_exception(syntax_error, format!("{}", err));
+            let exc = vm.new_syntax_error(&err);
             print_exception(vm, &exc);
             Err(err)
         }
@@ -192,7 +231,10 @@ fn run_shell(vm: &VirtualMachine) -> PyResult {
                 }
 
                 match shell_exec(vm, &input, vars.clone()) {
-                    Err(CompileError::Parse(ParseError::EOF(_))) => {
+                    Err(CompileError {
+                        error: CompileErrorType::Parse(ParseError::EOF(_)),
+                        ..
+                    }) => {
                         continuing = true;
                         continue;
                     }

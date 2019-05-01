@@ -21,7 +21,7 @@ use crate::obj::objbool;
 use crate::obj::objbuiltinfunc::PyBuiltinFunction;
 use crate::obj::objbytearray;
 use crate::obj::objbytes;
-use crate::obj::objclassmethod;
+use crate::obj::objclassmethod::{self, PyClassMethod};
 use crate::obj::objcode;
 use crate::obj::objcode::PyCodeRef;
 use crate::obj::objcomplex::{self, PyComplex};
@@ -51,6 +51,7 @@ use crate::obj::objstr;
 use crate::obj::objsuper;
 use crate::obj::objtuple::{self, PyTuple, PyTupleRef};
 use crate::obj::objtype::{self, PyClass, PyClassRef};
+use crate::obj::objweakproxy;
 use crate::obj::objweakref;
 use crate::obj::objzip;
 use crate::vm::VirtualMachine;
@@ -158,6 +159,7 @@ pub struct PyContext {
     pub module_type: PyClassRef,
     pub bound_method_type: PyClassRef,
     pub weakref_type: PyClassRef,
+    pub weakproxy_type: PyClassRef,
     pub object: PyClassRef,
     pub exceptions: exceptions::ExceptionZoo,
 }
@@ -255,6 +257,7 @@ impl PyContext {
         let readonly_property_type = create_type("readonly_property", &type_type, &object_type);
         let super_type = create_type("super", &type_type, &object_type);
         let weakref_type = create_type("ref", &type_type, &object_type);
+        let weakproxy_type = create_type("weakproxy", &type_type, &object_type);
         let generator_type = create_type("generator", &type_type, &object_type);
         let bound_method_type = create_type("method", &type_type, &object_type);
         let str_type = create_type("str", &type_type, &object_type);
@@ -361,6 +364,7 @@ impl PyContext {
             module_type,
             bound_method_type,
             weakref_type,
+            weakproxy_type,
             type_type,
             exceptions,
         };
@@ -396,6 +400,7 @@ impl PyContext {
         objcode::init(&context);
         objframe::init(&context);
         objweakref::init(&context);
+        objweakproxy::init(&context);
         objnone::init(&context);
         objmodule::init(&context);
         exceptions::init(&context);
@@ -554,6 +559,10 @@ impl PyContext {
         self.weakref_type.clone()
     }
 
+    pub fn weakproxy_type(&self) -> PyClassRef {
+        self.weakproxy_type.clone()
+    }
+
     pub fn type_type(&self) -> PyClassRef {
         self.type_type.clone()
     }
@@ -655,6 +664,19 @@ impl PyContext {
         PyObject::new(
             PyBuiltinFunction::new(f.into_func()),
             self.builtin_function_or_method_type(),
+            None,
+        )
+    }
+
+    pub fn new_classmethod<F, T, R>(&self, f: F) -> PyObjectRef
+    where
+        F: IntoPyNativeFunc<T, R>,
+    {
+        PyObject::new(
+            PyClassMethod {
+                callable: self.new_rustfunc(f),
+            },
+            self.classmethod_type(),
             None,
         )
     }
@@ -866,6 +888,39 @@ where
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let value: &T = self.obj.payload().expect("unexpected payload for type");
         fmt::Display::fmt(value, f)
+    }
+}
+
+#[derive(Clone)]
+pub struct PyCallable {
+    obj: PyObjectRef,
+}
+
+impl PyCallable {
+    #[inline]
+    pub fn invoke(&self, args: impl Into<PyFuncArgs>, vm: &VirtualMachine) -> PyResult {
+        vm.invoke(self.obj.clone(), args)
+    }
+
+    #[inline]
+    pub fn into_object(self) -> PyObjectRef {
+        self.obj
+    }
+}
+
+impl TryFromObject for PyCallable {
+    fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
+        if vm.is_callable(&obj) {
+            Ok(PyCallable { obj })
+        } else {
+            Err(vm.new_type_error(format!("'{}' object is not callable", obj.class().name)))
+        }
+    }
+}
+
+impl IntoPyObject for PyCallable {
+    fn into_pyobject(self, _vm: &VirtualMachine) -> PyResult {
+        Ok(self.into_object())
     }
 }
 

@@ -69,6 +69,18 @@ assert (1, 2) == next(items)
 data[3] = "changed"
 assert (3, "changed") == next(items)
 
+# But we can't add or delete items during iteration.
+d = {}
+a = iter(d.items())
+d['a'] = 2
+b = iter(d.items())
+assert ('a', 2) == next(b)
+with assertRaises(RuntimeError):
+    next(a)
+del d['a']
+with assertRaises(RuntimeError):
+    next(b)
+
 # View isn't itself an iterator.
 with assertRaises(TypeError):
     next(data.keys())
@@ -154,3 +166,28 @@ assert y == {'a': 2, 'b': 12, 'c': 19, 'd': -1}
 
 y.update(y)
 assert y == {'a': 2, 'b': 12, 'c': 19, 'd': -1}  # hasn't changed
+
+x = {1: 'a', '1': None}
+assert x.pop(1) == 'a'
+assert x.pop('1') is None
+assert x == {}
+
+with assertRaises(KeyError):
+    x.pop("not here")
+
+x = {1: 'a'}
+assert (1, 'a') == x.popitem()
+with assertRaises(KeyError):
+    x.popitem()
+assert x == {}
+
+x = {'a': 4}
+assert 4 == x.setdefault('a', 0)
+assert x['a'] == 4
+assert 0 == x.setdefault('b', 0)
+assert x['b'] == 0
+assert None == x.setdefault('c')
+assert x['c'] is None
+
+assert {1: None, "b": None} == dict.fromkeys([1, "b"])
+assert {1: 0, "b": 0} == dict.fromkeys([1, "b"], 0)

@@ -14,6 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::builtins;
 use crate::bytecode;
+use crate::error::CompileError;
 use crate::frame::{ExecutionResult, Frame, FrameRef, Scope};
 use crate::function::PyFuncArgs;
 use crate::obj::objbool;
@@ -49,6 +50,7 @@ pub struct VirtualMachine {
     pub ctx: PyContext,
     pub frames: RefCell<Vec<FrameRef>>,
     pub wasm_id: Option<String>,
+    pub exceptions: RefCell<Vec<PyObjectRef>>,
 }
 
 impl VirtualMachine {
@@ -68,6 +70,7 @@ impl VirtualMachine {
             ctx,
             frames: RefCell::new(vec![]),
             wasm_id: None,
+            exceptions: RefCell::new(vec![]),
         };
 
         builtins::make_module(&vm, builtins.clone());
@@ -234,9 +237,12 @@ impl VirtualMachine {
         self.new_exception(overflow_error, msg)
     }
 
-    pub fn new_syntax_error<T: ToString>(&self, msg: &T) -> PyObjectRef {
-        let syntax_error = self.ctx.exceptions.syntax_error.clone();
-        self.new_exception(syntax_error, msg.to_string())
+    pub fn new_syntax_error(&self, error: &CompileError) -> PyObjectRef {
+        let syntax_error_type = self.ctx.exceptions.syntax_error.clone();
+        let syntax_error = self.new_exception(syntax_error_type, error.to_string());
+        let lineno = self.new_int(error.location.get_row());
+        self.set_attr(&syntax_error, "lineno", lineno).unwrap();
+        syntax_error
     }
 
     pub fn get_none(&self) -> PyObjectRef {
@@ -300,8 +306,12 @@ impl VirtualMachine {
 
     /// Determines if `subclass` is a subclass of `cls`, either directly, indirectly or virtually
     /// via the __subclasscheck__ magic method.
-    pub fn issubclass(&self, subclass: &PyObjectRef, cls: &PyObjectRef) -> PyResult<bool> {
-        let ret = self.call_method(cls, "__subclasscheck__", vec![subclass.clone()])?;
+    pub fn issubclass(&self, subclass: &PyClassRef, cls: &PyClassRef) -> PyResult<bool> {
+        let ret = self.call_method(
+            cls.as_object(),
+            "__subclasscheck__",
+            vec![subclass.clone().into_object()],
+        )?;
         objbool::boolval(self, ret)
     }
 
@@ -337,11 +347,7 @@ impl VirtualMachine {
         }
     }
 
-    pub fn invoke<T>(&self, func_ref: PyObjectRef, args: T) -> PyResult
-    where
-        T: Into<PyFuncArgs>,
-    {
-        let args = args.into();
+    fn _invoke(&self, func_ref: PyObjectRef, args: PyFuncArgs) -> PyResult {
         trace!("Invoke: {:?} {:?}", func_ref, args);
         if let Some(PyFunction {
             ref code,
@@ -350,22 +356,29 @@ impl VirtualMachine {
             ref kw_only_defaults,
         }) = func_ref.payload()
         {
-            return self.invoke_python_function(code, scope, defaults, kw_only_defaults, args);
-        }
-        if let Some(PyMethod {
+            self.invoke_python_function(code, scope, defaults, kw_only_defaults, args)
+        } else if let Some(PyMethod {
             ref function,
             ref object,
         }) = func_ref.payload()
         {
-            return self.invoke(function.clone(), args.insert(object.clone()));
+            self.invoke(function.clone(), args.insert(object.clone()))
+        } else if let Some(PyBuiltinFunction { ref value }) = func_ref.payload() {
+            value(self, args)
+        } else {
+            // TODO: is it safe to just invoke __call__ otherwise?
+            trace!("invoke __call__ for: {:?}", &func_ref.payload);
+            self.call_method(&func_ref, "__call__", args)
         }
-        if let Some(PyBuiltinFunction { ref value }) = func_ref.payload() {
-            return value(self, args);
-        }
+    }
 
-        // TODO: is it safe to just invoke __call__ otherwise?
-        trace!("invoke __call__ for: {:?}", &func_ref.payload);
-        self.call_method(&func_ref, "__call__", args)
+    // TODO: make func_ref an &PyObjectRef
+    #[inline]
+    pub fn invoke<T>(&self, func_ref: PyObjectRef, args: T) -> PyResult
+    where
+        T: Into<PyFuncArgs>,
+    {
+        self._invoke(func_ref, args.into())
     }
 
     fn invoke_python_function(
@@ -662,6 +675,15 @@ impl VirtualMachine {
         crate::stdlib::json::de_pyobject(self, s)
     }
 
+    pub fn is_callable(&self, obj: &PyObjectRef) -> bool {
+        match_class!(obj,
+            PyFunction => true,
+            PyMethod => true,
+            PyBuiltinFunction => true,
+            obj => objtype::class_has_attr(&obj.class(), "__call__"),
+        )
+    }
+
     pub fn _sub(&self, a: PyObjectRef, b: PyObjectRef) -> PyResult {
         self.call_or_reflection(a, b, "__sub__", "__rsub__", |vm, a, b| {
             Err(vm.new_unsupported_operand_error(a, b, "-"))
@@ -904,6 +926,14 @@ impl VirtualMachine {
         } else {
             self._membership_iter_search(haystack, needle)
         }
+    }
+
+    pub fn push_exception(&self, exc: PyObjectRef) -> () {
+        self.exceptions.borrow_mut().push(exc)
+    }
+
+    pub fn pop_exception(&self) -> Option<PyObjectRef> {
+        self.exceptions.borrow_mut().pop()
     }
 }
 

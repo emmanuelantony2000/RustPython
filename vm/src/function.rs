@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 use std::ops::RangeInclusive;
 
 use crate::obj::objtype::{isinstance, PyClassRef};
@@ -45,6 +46,12 @@ impl From<(&Args, &KwArgs)> for PyFuncArgs {
             args: args.clone(),
             kwargs: kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
+    }
+}
+
+impl FromArgs for PyFuncArgs {
+    fn from_args(_vm: &VirtualMachine, args: &mut PyFuncArgs) -> Result<Self, ArgumentError> {
+        Ok(mem::replace(args, Default::default()))
     }
 }
 
@@ -352,6 +359,23 @@ impl<T> OptionalArg<T> {
         match self {
             Present(value) => Some(value),
             Missing => None,
+        }
+    }
+
+    pub fn unwrap_or(self, default: T) -> T {
+        match self {
+            Present(value) => value,
+            Missing => default,
+        }
+    }
+
+    pub fn unwrap_or_else<F>(self, f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        match self {
+            Present(value) => value,
+            Missing => f(),
         }
     }
 }

@@ -3,8 +3,8 @@ use std::fmt;
 
 use crate::function::{KwArgs, OptionalArg};
 use crate::pyobject::{
-    IdProtocol, IntoPyObject, ItemProtocol, PyAttributes, PyContext, PyObjectRef, PyRef, PyResult,
-    PyValue,
+    IdProtocol, IntoPyObject, ItemProtocol, PyAttributes, PyContext, PyIterable, PyObjectRef,
+    PyRef, PyResult, PyValue,
 };
 use crate::vm::{ReprGuard, VirtualMachine};
 
@@ -19,8 +19,7 @@ pub type DictContentType = dictdatatype::Dict;
 
 #[derive(Default)]
 pub struct PyDict {
-    // TODO: should be private
-    pub entries: RefCell<DictContentType>,
+    entries: RefCell<DictContentType>,
 }
 pub type PyDictRef = PyRef<PyDict>;
 
@@ -92,6 +91,22 @@ impl PyDictRef {
             dict_borrowed.insert(vm, &vm.new_str(key), value)?;
         }
         Ok(())
+    }
+
+    fn fromkeys(
+        class: PyClassRef,
+        iterable: PyIterable,
+        value: OptionalArg<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyDictRef> {
+        let mut dict = DictContentType::default();
+        let value = value.unwrap_or_else(|| vm.ctx.none());
+        for elem in iterable.iter(vm)? {
+            let elem = elem?;
+            dict.insert(vm, &elem, value.clone())?;
+        }
+        let entries = RefCell::new(dict);
+        PyDict { entries }.into_ref_with_type(vm, class)
     }
 
     fn bool(self, _vm: &VirtualMachine) -> bool {
@@ -207,10 +222,24 @@ impl PyDictRef {
     ) -> PyResult {
         match self.entries.borrow().get(vm, &key)? {
             Some(value) => Ok(value),
-            None => match default {
-                OptionalArg::Present(value) => Ok(value),
-                OptionalArg::Missing => Ok(vm.ctx.none()),
-            },
+            None => Ok(default.unwrap_or_else(|| vm.ctx.none())),
+        }
+    }
+
+    fn setdefault(
+        self,
+        key: PyObjectRef,
+        default: OptionalArg<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        let mut entries = self.entries.borrow_mut();
+        match entries.get(vm, &key)? {
+            Some(value) => Ok(value),
+            None => {
+                let set_value = default.unwrap_or_else(|| vm.ctx.none());
+                entries.insert(vm, &key, set_value.clone())?;
+                Ok(set_value)
+            }
         }
     }
 
@@ -227,6 +256,23 @@ impl PyDictRef {
         vm: &VirtualMachine,
     ) -> PyResult<()> {
         PyDictRef::merge(&self.entries, dict_obj, kwargs, vm)
+    }
+
+    fn pop(self, key: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        self.entries.borrow_mut().pop(vm, &key)
+    }
+
+    fn popitem(self, vm: &VirtualMachine) -> PyResult {
+        let mut entries = self.entries.borrow_mut();
+        let (key, value) = match entries.next_entry(&mut 0) {
+            Some((key, value)) => (key.clone(), value.clone()),
+            None => {
+                return Err(vm.new_key_error("popitem(): dictionary is empty".to_string()));
+            }
+        };
+
+        entries.delete(vm, &key)?;
+        Ok(vm.ctx.new_tuple(vec![key, value]))
     }
 
     /// Take a python dictionary and convert it to attributes.
@@ -259,6 +305,10 @@ impl PyDictRef {
     pub fn contains_key<T: IntoPyObject>(&self, key: T, vm: &VirtualMachine) -> bool {
         let key = key.into_pyobject(vm).unwrap();
         self.entries.borrow().contains(vm, &key).unwrap()
+    }
+
+    pub fn size(&self) -> dictdatatype::DictSize {
+        self.entries.borrow().size()
     }
 }
 
@@ -315,11 +365,8 @@ impl Iterator for DictIter {
     type Item = (PyObjectRef, PyObjectRef);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.dict.entries.borrow().next_entry(self.position) {
-            Some((new_position, key, value)) => {
-                self.position = new_position;
-                Some((key.clone(), value.clone()))
-            }
+        match self.dict.entries.borrow().next_entry(&mut self.position) {
+            Some((key, value)) => Some((key.clone(), value.clone())),
             None => None,
         }
     }
@@ -327,13 +374,13 @@ impl Iterator for DictIter {
 
 macro_rules! dict_iterator {
     ( $name: ident, $iter_name: ident, $class: ident, $iter_class: ident, $class_name: literal, $iter_class_name: literal, $result_fn: expr) => {
-        #[pyclass(name = $class_name, __inside_vm)]
+        #[pyclass(name = $class_name)]
         #[derive(Debug)]
         struct $name {
             pub dict: PyDictRef,
         }
 
-        #[pyimpl(__inside_vm)]
+        #[pyimpl]
         impl $name {
             fn new(dict: PyDictRef) -> Self {
                 $name { dict: dict }
@@ -356,27 +403,37 @@ macro_rules! dict_iterator {
             }
         }
 
-        #[pyclass(name = $iter_class_name, __inside_vm)]
+        #[pyclass(name = $iter_class_name)]
         #[derive(Debug)]
         struct $iter_name {
             pub dict: PyDictRef,
+            pub size: dictdatatype::DictSize,
             pub position: Cell<usize>,
         }
 
-        #[pyimpl(__inside_vm)]
+        #[pyimpl]
         impl $iter_name {
             fn new(dict: PyDictRef) -> Self {
                 $iter_name {
                     position: Cell::new(0),
+                    size: dict.size(),
                     dict,
                 }
             }
 
             #[pymethod(name = "__next__")]
             fn next(&self, vm: &VirtualMachine) -> PyResult {
-                match self.dict.entries.borrow().next_entry(self.position.get()) {
-                    Some((new_position, key, value)) => {
-                        self.position.set(new_position);
+                let mut position = self.position.get();
+                let dict = self.dict.entries.borrow();
+                if dict.has_changed_size(&self.size) {
+                    return Err(vm.new_exception(
+                        vm.ctx.exceptions.runtime_error.clone(),
+                        "dictionary changed size during iteration".to_string(),
+                    ));
+                }
+                match dict.next_entry(&mut position) {
+                    Some((key, value)) => {
+                        self.position.set(position);
                         Ok($result_fn(vm, key, value))
                     }
                     None => Err(objiter::new_stop_iteration(vm)),
@@ -445,9 +502,13 @@ pub fn init(context: &PyContext) {
         "values" => context.new_rustfunc(PyDictRef::values),
         "items" => context.new_rustfunc(PyDictRef::items),
         "keys" => context.new_rustfunc(PyDictRef::keys),
+        "fromkeys" => context.new_classmethod(PyDictRef::fromkeys),
         "get" => context.new_rustfunc(PyDictRef::get),
+        "setdefault" => context.new_rustfunc(PyDictRef::setdefault),
         "copy" => context.new_rustfunc(PyDictRef::copy),
         "update" => context.new_rustfunc(PyDictRef::update),
+        "pop" => context.new_rustfunc(PyDictRef::pop),
+        "popitem" => context.new_rustfunc(PyDictRef::popitem),
     });
 
     PyDictKeys::extend_class(context, &context.dictkeys_type);
