@@ -2,15 +2,18 @@ use super::objbytes;
 use super::objint;
 use super::objstr;
 use super::objtype;
+use crate::function::OptionalArg;
 use crate::obj::objtype::PyClassRef;
 use crate::pyobject::{
-    IntoPyObject, PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult, PyValue, TypeProtocol,
+    IdProtocol, IntoPyObject, PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult, PyValue,
+    TypeProtocol,
 };
 use crate::vm::VirtualMachine;
 use num_bigint::{BigInt, ToBigInt};
 use num_rational::Ratio;
-use num_traits::ToPrimitive;
+use num_traits::{ToPrimitive, Zero};
 
+/// Convert a string or number to a floating point number, if possible.
 #[pyclass(name = "float")]
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct PyFloat {
@@ -41,7 +44,7 @@ impl From<f64> for PyFloat {
     }
 }
 
-fn try_float(value: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Option<f64>> {
+pub fn try_float(value: &PyObjectRef, vm: &VirtualMachine) -> PyResult<Option<f64>> {
     Ok(if objtype::isinstance(&value, &vm.ctx.float_type()) {
         Some(get_value(&value))
     } else if objtype::isinstance(&value, &vm.ctx.int_type()) {
@@ -64,6 +67,28 @@ fn inner_mod(v1: f64, v2: f64, vm: &VirtualMachine) -> PyResult<f64> {
         Ok(v1 % v2)
     } else {
         Err(vm.new_zero_division_error("float mod by zero".to_string()))
+    }
+}
+
+fn try_to_bigint(value: f64, vm: &VirtualMachine) -> PyResult<BigInt> {
+    match value.to_bigint() {
+        Some(int) => Ok(int),
+        None => {
+            if value.is_infinite() {
+                Err(vm.new_overflow_error(
+                    "OverflowError: cannot convert float NaN to integer".to_string(),
+                ))
+            } else if value.is_nan() {
+                Err(vm
+                    .new_value_error("ValueError: cannot convert float NaN to integer".to_string()))
+            } else {
+                // unreachable unless BigInt has a bug
+                unreachable!(
+                    "A finite float value failed to be converted to bigint: {}",
+                    value
+                )
+            }
+        }
     }
 }
 
@@ -222,7 +247,8 @@ impl PyFloat {
         )
     }
 
-    fn new_float(cls: PyClassRef, arg: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyFloatRef> {
+    #[pymethod(name = "__new__")]
+    fn float_new(cls: PyClassRef, arg: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyFloatRef> {
         let value = if objtype::isinstance(&arg, &vm.ctx.float_type()) {
             get_value(&arg)
         } else if objtype::isinstance(&arg, &vm.ctx.int_type()) {
@@ -309,8 +335,12 @@ impl PyFloat {
     }
 
     #[pymethod(name = "__repr__")]
-    fn repr(&self, _vm: &VirtualMachine) -> String {
-        self.value.to_string()
+    fn repr(&self, vm: &VirtualMachine) -> String {
+        if self.is_integer(vm) {
+            format!("{:.1}", self.value)
+        } else {
+            self.value.to_string()
+        }
     }
 
     #[pymethod(name = "__truediv__")]
@@ -343,12 +373,54 @@ impl PyFloat {
     }
 
     #[pymethod(name = "__trunc__")]
-    fn trunc(&self, _vm: &VirtualMachine) -> BigInt {
-        self.value.to_bigint().unwrap()
+    fn trunc(&self, vm: &VirtualMachine) -> PyResult<BigInt> {
+        try_to_bigint(self.value, vm)
+    }
+
+    #[pymethod(name = "__round__")]
+    fn round(&self, ndigits: OptionalArg<PyObjectRef>, vm: &VirtualMachine) -> PyResult {
+        let ndigits = match ndigits {
+            OptionalArg::Missing => None,
+            OptionalArg::Present(ref value) => {
+                if !vm.get_none().is(value) {
+                    let ndigits = if objtype::isinstance(value, &vm.ctx.int_type()) {
+                        objint::get_value(value)
+                    } else {
+                        return Err(vm.new_type_error(format!(
+                            "TypeError: '{}' object cannot be interpreted as an integer",
+                            value.class().name
+                        )));
+                    };
+                    if ndigits.is_zero() {
+                        None
+                    } else {
+                        Some(ndigits)
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        if ndigits.is_none() {
+            let fract = self.value.fract();
+            let value = if (fract.abs() - 0.5).abs() < std::f64::EPSILON {
+                if self.value.trunc() % 2.0 == 0.0 {
+                    self.value - fract
+                } else {
+                    self.value + fract
+                }
+            } else {
+                self.value.round()
+            };
+            let int = try_to_bigint(value, vm)?;
+            Ok(vm.ctx.new_int(int))
+        } else {
+            Ok(vm.ctx.not_implemented())
+        }
     }
 
     #[pymethod(name = "__int__")]
-    fn int(&self, vm: &VirtualMachine) -> BigInt {
+    fn int(&self, vm: &VirtualMachine) -> PyResult<BigInt> {
         self.trunc(vm)
     }
 
@@ -359,6 +431,16 @@ impl PyFloat {
 
     #[pyproperty(name = "real")]
     fn real(zelf: PyRef<Self>, _vm: &VirtualMachine) -> PyFloatRef {
+        zelf
+    }
+
+    #[pyproperty(name = "imag")]
+    fn imag(&self, _vm: &VirtualMachine) -> f64 {
+        0.0f64
+    }
+
+    #[pymethod(name = "conjugate")]
+    fn conjugate(zelf: PyRef<Self>, _vm: &VirtualMachine) -> PyFloatRef {
         zelf
     }
 
@@ -408,9 +490,4 @@ pub fn make_float(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<f64> {
 #[rustfmt::skip] // to avoid line splitting
 pub fn init(context: &PyContext) {
     PyFloat::extend_class(context, &context.float_type);
-    let float_doc = "Convert a string or number to a floating point number, if possible.";
-    extend_class!(context, &context.float_type, {
-        "__new__" => context.new_rustfunc(PyFloat::new_float),
-        "__doc__" => context.new_str(float_doc.to_string()),
-    });
 }

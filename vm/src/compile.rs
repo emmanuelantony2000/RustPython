@@ -130,18 +130,35 @@ impl Compiler {
         symbol_scope: SymbolScope,
     ) -> Result<(), CompileError> {
         self.scope_stack.push(symbol_scope);
-        for statement in &program.statements {
+
+        let mut emitted_return = false;
+
+        for (i, statement) in program.statements.iter().enumerate() {
+            let is_last = i == program.statements.len() - 1;
+
             if let ast::Statement::Expression { ref expression } = statement.node {
                 self.compile_expression(expression)?;
-                self.emit(Instruction::PrintExpr);
+
+                if is_last {
+                    self.emit(Instruction::Duplicate);
+                    self.emit(Instruction::PrintExpr);
+                    self.emit(Instruction::ReturnValue);
+                    emitted_return = true;
+                } else {
+                    self.emit(Instruction::PrintExpr);
+                }
             } else {
                 self.compile_statement(&statement)?;
             }
         }
-        self.emit(Instruction::LoadConst {
-            value: bytecode::Constant::None,
-        });
-        self.emit(Instruction::ReturnValue);
+
+        if !emitted_return {
+            self.emit(Instruction::LoadConst {
+                value: bytecode::Constant::None,
+            });
+            self.emit(Instruction::ReturnValue);
+        }
+
         Ok(())
     }
 
@@ -322,6 +339,9 @@ impl Compiler {
                 body,
                 orelse,
             } => self.compile_for(target, iter, body, orelse)?,
+            ast::Statement::AsyncFor { .. } => {
+                unimplemented!("async for");
+            }
             ast::Statement::Raise { exception, cause } => match exception {
                 Some(value) => {
                     self.compile_expression(value)?;
@@ -352,6 +372,9 @@ impl Compiler {
                 decorator_list,
                 returns,
             } => self.compile_function_def(name, args, body, decorator_list, returns)?,
+            ast::Statement::AsyncFunctionDef { .. } => {
+                unimplemented!("async def");
+            }
             ast::Statement::ClassDef {
                 name,
                 body,
@@ -1233,13 +1256,25 @@ impl Compiler {
             }
             ast::Expression::Dict { elements } => {
                 let size = elements.len();
+                let has_double_star = elements.iter().any(|e| e.0.is_none());
                 for (key, value) in elements {
-                    self.compile_expression(key)?;
-                    self.compile_expression(value)?;
+                    if let Some(key) = key {
+                        self.compile_expression(key)?;
+                        self.compile_expression(value)?;
+                        if has_double_star {
+                            self.emit(Instruction::BuildMap {
+                                size: 1,
+                                unpack: false,
+                            });
+                        }
+                    } else {
+                        // dict unpacking
+                        self.compile_expression(value)?;
+                    }
                 }
                 self.emit(Instruction::BuildMap {
                     size,
-                    unpack: false,
+                    unpack: has_double_star,
                 });
             }
             ast::Expression::Slice { elements } => {
@@ -1264,6 +1299,9 @@ impl Compiler {
                     }),
                 };
                 self.emit(Instruction::YieldValue);
+            }
+            ast::Expression::Await { .. } => {
+                unimplemented!("await");
             }
             ast::Expression::YieldFrom { value } => {
                 self.mark_generator();

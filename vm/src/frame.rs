@@ -98,6 +98,20 @@ impl Scope {
         Scope { locals, globals }
     }
 
+    pub fn with_builtins(
+        locals: Option<PyDictRef>,
+        globals: PyDictRef,
+        vm: &VirtualMachine,
+    ) -> Scope {
+        if !globals.contains_key("__builtins__", vm) {
+            globals
+                .clone()
+                .set_item("__builtins__", vm.builtins.clone(), vm)
+                .unwrap();
+        }
+        Scope::new(locals, globals)
+    }
+
     pub fn get_locals(&self) -> PyDictRef {
         match self.locals.iter().next() {
             Some(dict) => dict.clone(),
@@ -124,7 +138,7 @@ impl Scope {
 pub trait NameProtocol {
     fn load_name(&self, vm: &VirtualMachine, name: &str) -> Option<PyObjectRef>;
     fn store_name(&self, vm: &VirtualMachine, name: &str, value: PyObjectRef);
-    fn delete_name(&self, vm: &VirtualMachine, name: &str);
+    fn delete_name(&self, vm: &VirtualMachine, name: &str) -> PyResult;
     fn load_cell(&self, vm: &VirtualMachine, name: &str) -> Option<PyObjectRef>;
     fn store_cell(&self, vm: &VirtualMachine, name: &str, value: PyObjectRef);
     fn load_global(&self, vm: &VirtualMachine, name: &str) -> Option<PyObjectRef>;
@@ -169,8 +183,8 @@ impl NameProtocol for Scope {
         self.get_locals().set_item(key, value, vm).unwrap();
     }
 
-    fn delete_name(&self, vm: &VirtualMachine, key: &str) {
-        self.get_locals().del_item(key, vm).unwrap();
+    fn delete_name(&self, vm: &VirtualMachine, key: &str) -> PyResult {
+        self.get_locals().del_item(key, vm)
     }
 
     fn load_global(&self, vm: &VirtualMachine, name: &str) -> Option<PyObjectRef> {
@@ -203,6 +217,7 @@ enum BlockType {
         end: bytecode::Label,
         context_manager: PyObjectRef,
     },
+    ExceptHandler,
 }
 
 pub type FrameRef = PyRef<Frame>;
@@ -861,8 +876,13 @@ impl Frame {
                 Ok(None)
             }
             bytecode::Instruction::PopException {} => {
-                assert!(vm.pop_exception().is_some());
-                Ok(None)
+                let block = self.pop_block().unwrap(); // this asserts that the block is_some.
+                if let BlockType::ExceptHandler = block.typ {
+                    assert!(vm.pop_exception().is_some());
+                    Ok(None)
+                } else {
+                    panic!("Block type must be ExceptHandler here.")
+                }
             }
         }
     }
@@ -937,6 +957,9 @@ impl Frame {
                         }
                     }
                 }
+                BlockType::ExceptHandler => {
+                    vm.pop_exception();
+                }
             }
         }
 
@@ -959,6 +982,9 @@ impl Frame {
                         panic!("Exception in with __exit__ {:?}", exc);
                     }
                 },
+                BlockType::ExceptHandler => {
+                    vm.pop_exception();
+                }
             }
 
             self.pop_block();
@@ -970,6 +996,7 @@ impl Frame {
         while let Some(block) = self.pop_block() {
             match block.typ {
                 BlockType::TryExcept { handler } => {
+                    self.push_block(BlockType::ExceptHandler {});
                     self.push_value(exc.clone());
                     vm.push_exception(exc);
                     self.jump(handler);
@@ -1004,6 +1031,8 @@ impl Frame {
                     }
                 }
                 BlockType::Loop { .. } => {}
+                // Exception was already poped on Raised.
+                BlockType::ExceptHandler => {}
             }
         }
         Some(exc)
@@ -1056,8 +1085,10 @@ impl Frame {
     }
 
     fn delete_name(&self, vm: &VirtualMachine, name: &str) -> FrameResult {
-        self.scope.delete_name(vm, name);
-        Ok(None)
+        match self.scope.delete_name(vm, name) {
+            Ok(_) => Ok(None),
+            Err(_) => Err(vm.new_name_error(format!("name '{}' is not defined", name))),
+        }
     }
 
     fn load_name(
@@ -1075,10 +1106,7 @@ impl Frame {
         let value = match optional_value {
             Some(value) => value,
             None => {
-                let name_error_type = vm.ctx.exceptions.name_error.clone();
-                let msg = format!("name '{}' is not defined", name);
-                let name_error = vm.new_exception(name_error_type, msg);
-                return Err(name_error);
+                return Err(vm.new_name_error(format!("name '{}' is not defined", name)));
             }
         };
 

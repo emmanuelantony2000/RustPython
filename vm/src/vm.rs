@@ -186,6 +186,11 @@ impl VirtualMachine {
         self.new_exception(type_error, msg)
     }
 
+    pub fn new_name_error(&self, msg: String) -> PyObjectRef {
+        let name_error = self.ctx.exceptions.name_error.clone();
+        self.new_exception(name_error, msg)
+    }
+
     pub fn new_unsupported_operand_error(
         &self,
         a: PyObjectRef,
@@ -243,6 +248,10 @@ impl VirtualMachine {
         let lineno = self.new_int(error.location.get_row());
         self.set_attr(&syntax_error, "lineno", lineno).unwrap();
         syntax_error
+    }
+
+    pub fn new_scope_with_builtins(&self) -> Scope {
+        Scope::with_builtins(None, self.ctx.new_dict(), self)
     }
 
     pub fn get_none(&self) -> PyObjectRef {

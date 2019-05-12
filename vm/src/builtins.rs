@@ -6,7 +6,8 @@ use std::char;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use num_traits::Signed;
+use num_bigint::Sign;
+use num_traits::{Signed, Zero};
 
 use crate::compile;
 use crate::import::import_module;
@@ -16,14 +17,13 @@ use crate::obj::objdict::PyDictRef;
 use crate::obj::objint::{self, PyIntRef};
 use crate::obj::objiter;
 use crate::obj::objstr::{self, PyString, PyStringRef};
-use crate::obj::objtuple::PyTuple;
-use crate::obj::objtype::{self, PyClass, PyClassRef};
+use crate::obj::objtype::{self, PyClassRef};
 
 use crate::frame::Scope;
-use crate::function::{Args, KwArgs, OptionalArg, PyFuncArgs};
+use crate::function::{single_or_tuple_any, Args, KwArgs, OptionalArg, PyFuncArgs};
 use crate::pyobject::{
-    IdProtocol, ItemProtocol, PyIterable, PyObjectRef, PyResult, PyValue, TryFromObject,
-    TypeProtocol,
+    IdProtocol, IntoPyObject, ItemProtocol, PyIterable, PyObjectRef, PyResult, PyValue,
+    TryFromObject, TypeProtocol,
 };
 use crate::vm::VirtualMachine;
 
@@ -72,10 +72,10 @@ fn builtin_callable(obj: PyObjectRef, vm: &VirtualMachine) -> bool {
     vm.is_callable(&obj)
 }
 
-fn builtin_chr(i: u32, _vm: &VirtualMachine) -> String {
+fn builtin_chr(i: u32, vm: &VirtualMachine) -> PyResult<String> {
     match char::from_u32(i) {
-        Some(value) => value.to_string(),
-        None => '_'.to_string(),
+        Some(value) => Ok(value.to_string()),
+        None => Err(vm.new_value_error("chr() arg not in range(0x110000)".to_string())),
     }
 }
 
@@ -170,7 +170,7 @@ fn builtin_exec(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
         vm,
         args,
         required = [(source, None)],
-        optional = [(globals, None), (locals, Some(vm.ctx.dict_type()))]
+        optional = [(globals, None), (locals, None)]
     );
 
     let scope = make_scope(vm, globals, locals)?;
@@ -217,18 +217,32 @@ fn make_scope(
         }
         None => None,
     };
-
     let current_scope = vm.current_scope();
-    let globals = match globals {
-        Some(dict) => dict.clone().downcast().unwrap(),
-        None => current_scope.globals.clone(),
-    };
     let locals = match locals {
         Some(dict) => dict.clone().downcast().ok(),
-        None => current_scope.get_only_locals(),
+        None => {
+            if globals.is_some() {
+                None
+            } else {
+                current_scope.get_only_locals()
+            }
+        }
+    };
+    let globals = match globals {
+        Some(dict) => {
+            let dict: PyDictRef = dict.clone().downcast().unwrap();
+            if !dict.contains_key("__builtins__", vm) {
+                let builtins_dict = vm.builtins.dict.as_ref().unwrap().as_object();
+                dict.set_item("__builtins__", builtins_dict.clone(), vm)
+                    .unwrap();
+            }
+            dict
+        }
+        None => current_scope.globals.clone(),
     };
 
-    Ok(Scope::new(locals, globals))
+    let scope = Scope::with_builtins(locals, globals, vm);
+    Ok(scope)
 }
 
 fn builtin_format(
@@ -316,29 +330,18 @@ fn builtin_id(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
 
 // builtin_input
 
-fn type_test(
-    vm: &VirtualMachine,
-    typ: PyObjectRef,
-    test: impl Fn(&PyClassRef) -> PyResult<bool>,
-    test_name: &str,
-) -> PyResult<bool> {
-    match_class!(typ,
-        cls @ PyClass => test(&cls),
-        tuple @ PyTuple => {
-            for cls_obj in tuple.elements.borrow().iter() {
-                let cls = PyClassRef::try_from_object(vm, cls_obj.clone())?;
-                if test(&cls)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        },
-        _ => Err(vm.new_type_error(format!("{}() arg 2 must be a type or tuple of types", test_name)))
-    )
-}
-
 fn builtin_isinstance(obj: PyObjectRef, typ: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
-    type_test(vm, typ, |cls| vm.isinstance(&obj, cls), "isinstance")
+    single_or_tuple_any(
+        typ,
+        |cls: PyClassRef| vm.isinstance(&obj, &cls),
+        |o| {
+            format!(
+                "isinstance() arg 2 must be a type or tuple of types, not {}",
+                o.class()
+            )
+        },
+        vm,
+    )
 }
 
 fn builtin_issubclass(
@@ -346,7 +349,17 @@ fn builtin_issubclass(
     typ: PyObjectRef,
     vm: &VirtualMachine,
 ) -> PyResult<bool> {
-    type_test(vm, typ, |cls| vm.issubclass(&subclass, cls), "issubclass")
+    single_or_tuple_any(
+        typ,
+        |cls: PyClassRef| vm.issubclass(&subclass, &cls),
+        |o| {
+            format!(
+                "issubclass() arg 2 must be a class or tuple of classes, not {}",
+                o.class()
+            )
+        },
+        vm,
+    )
 }
 
 fn builtin_iter(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
@@ -506,9 +519,9 @@ fn builtin_oct(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
 
 fn builtin_ord(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
     arg_check!(vm, args, required = [(string, Some(vm.ctx.str_type()))]);
-    let string = objstr::get_value(string);
+    let string = objstr::borrow_value(string);
     let string_len = string.chars().count();
-    if string_len > 1 {
+    if string_len != 1 {
         return Err(vm.new_type_error(format!(
             "ord() expected a character, but string of length {} found",
             string_len
@@ -529,25 +542,33 @@ fn builtin_pow(vm: &VirtualMachine, args: PyFuncArgs) -> PyResult {
         required = [(x, None), (y, None)],
         optional = [(mod_value, Some(vm.ctx.int_type()))]
     );
-    let pow_method_name = "__pow__";
-    let result = match vm.get_method(x.clone(), pow_method_name) {
-        Ok(attrib) => vm.invoke(attrib, vec![y.clone()]),
-        Err(..) => Err(vm.new_type_error("unsupported operand type(s) for pow".to_string())),
-    };
-    //Check if the 3rd argument is defined and perform modulus on the result
-    //this should be optimized in the future to perform a "power-mod" algorithm in
-    //order to improve performance
+
     match mod_value {
-        Some(mod_value) => {
-            let mod_method_name = "__mod__";
-            match vm.get_method(result.expect("result not defined").clone(), mod_method_name) {
-                Ok(value) => vm.invoke(value, vec![mod_value.clone()]),
-                Err(..) => {
-                    Err(vm.new_type_error("unsupported operand type(s) for mod".to_string()))
-                }
+        None => vm.call_or_reflection(x.clone(), y.clone(), "__pow__", "__rpow__", |vm, x, y| {
+            Err(vm.new_unsupported_operand_error(x, y, "pow"))
+        }),
+        Some(m) => {
+            // Check if the 3rd argument is defined and perform modulus on the result
+            if !(objtype::isinstance(x, &vm.ctx.int_type())
+                && objtype::isinstance(y, &vm.ctx.int_type()))
+            {
+                return Err(vm.new_type_error(
+                    "pow() 3rd argument not allowed unless all arguments are integers".to_string(),
+                ));
             }
+            let y = objint::get_value(y);
+            if y.sign() == Sign::Minus {
+                return Err(vm.new_value_error(
+                    "pow() 2nd argument cannot be negative when 3rd argument specified".to_string(),
+                ));
+            }
+            let m = objint::get_value(m);
+            if m.is_zero() {
+                return Err(vm.new_value_error("pow() 3rd argument cannot be 0".to_string()));
+            }
+            let x = objint::get_value(x);
+            Ok(vm.new_int(x.modpow(&y, &m)))
         }
-        None => result,
     }
 }
 
@@ -559,32 +580,77 @@ pub struct PrintOptions {
     end: Option<PyStringRef>,
     #[pyarg(keyword_only, default = "false")]
     flush: bool,
+    #[pyarg(keyword_only, default = "None")]
+    file: Option<PyObjectRef>,
+}
+
+trait Printer {
+    fn write(&mut self, vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<()>;
+    fn flush(&mut self, vm: &VirtualMachine) -> PyResult<()>;
+}
+
+impl Printer for &'_ PyObjectRef {
+    fn write(&mut self, vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<()> {
+        vm.call_method(self, "write", vec![obj])?;
+        Ok(())
+    }
+
+    fn flush(&mut self, vm: &VirtualMachine) -> PyResult<()> {
+        vm.call_method(self, "flush", vec![])?;
+        Ok(())
+    }
+}
+
+impl Printer for std::io::StdoutLock<'_> {
+    fn write(&mut self, vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<()> {
+        let s = &vm.to_str(&obj)?.value;
+        write!(self, "{}", s).unwrap();
+        Ok(())
+    }
+
+    fn flush(&mut self, _vm: &VirtualMachine) -> PyResult<()> {
+        <Self as std::io::Write>::flush(self).unwrap();
+        Ok(())
+    }
 }
 
 pub fn builtin_print(objects: Args, options: PrintOptions, vm: &VirtualMachine) -> PyResult<()> {
     let stdout = io::stdout();
-    let mut stdout_lock = stdout.lock();
+
+    let mut printer: Box<dyn Printer> = if let Some(file) = &options.file {
+        Box::new(file)
+    } else {
+        Box::new(stdout.lock())
+    };
+
+    let sep = options
+        .sep
+        .as_ref()
+        .map_or(" ", |sep| &sep.value)
+        .into_pyobject(vm)
+        .unwrap();
+
     let mut first = true;
     for object in objects {
         if first {
             first = false;
-        } else if let Some(ref sep) = options.sep {
-            write!(stdout_lock, "{}", sep.value).unwrap();
         } else {
-            write!(stdout_lock, " ").unwrap();
+            printer.write(vm, sep.clone())?;
         }
-        let s = &vm.to_str(&object)?.value;
-        write!(stdout_lock, "{}", s).unwrap();
+
+        printer.write(vm, object)?;
     }
 
-    if let Some(end) = options.end {
-        write!(stdout_lock, "{}", end.value).unwrap();
-    } else {
-        writeln!(stdout_lock).unwrap();
-    }
+    let end = options
+        .end
+        .as_ref()
+        .map_or("\n", |end| &end.value)
+        .into_pyobject(vm)
+        .unwrap();
+    printer.write(vm, end)?;
 
     if options.flush {
-        stdout_lock.flush().unwrap();
+        printer.flush(vm)?;
     }
 
     Ok(())
