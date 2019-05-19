@@ -472,7 +472,7 @@ impl PySetRef {
         Ok(vm.new_str(s))
     }
 
-    fn add(self, item: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+    pub fn add(self, item: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         self.inner.borrow_mut().add(&item, vm)
     }
 
@@ -759,7 +759,7 @@ impl TryFromObject for SetIterable {
     }
 }
 
-fn set_hash(_zelf: PySetRef, vm: &VirtualMachine) -> PyResult {
+fn set_hash(_zelf: PySetRef, vm: &VirtualMachine) -> PyResult<()> {
     Err(vm.new_type_error("unhashable type".to_string()))
 }
 
